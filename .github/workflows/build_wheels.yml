@@ -28,7 +28,32 @@ concurrency:
   cancel-in-progress: ${{ github.event_name != 'release' }}
 
 jobs:
+  # Gate: skip the cp313-only smoke build when this commit carries a version
+  # tag (e.g. 13.5). The release event then does the full cp310-314 build, so
+  # nothing needs cancelling and the release commit stays green.
+  # Skipped != cancelled: skipped jobs don't produce a red X.
+  check-release-tag:
+    runs-on: ubuntu-latest
+    outputs:
+      is_release_commit: ${{ steps.tag.outputs.is_release_commit }}
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+          fetch-tags: true
+      - id: tag
+        run: |
+          tags=$(git tag --points-at HEAD)
+          echo "Tags pointing at HEAD: $tags"
+          if echo "$tags" | grep -Eq '^[0-9]+\.[0-9]+(\.[0-9]+)?$'; then
+            echo "is_release_commit=true" >> "$GITHUB_OUTPUT"
+          else
+            echo "is_release_commit=false" >> "$GITHUB_OUTPUT"
+          fi
+
   cpython-linux-x86_64:
+    needs: check-release-tag
+    if: github.event_name != 'push' || needs.check-release-tag.outputs.is_release_commit != 'true'
     name: 'Linux CPython (${{ matrix.cibw_archs }}, ${{ matrix.manylinux_image }})'
     runs-on: ubuntu-22.04
     strategy:
@@ -113,6 +138,8 @@ jobs:
           retention-days: ${{ env.ARTIFACT_RETENTION }}
 
   cpython-linux-aarch64:
+    needs: check-release-tag
+    if: github.event_name != 'push' || needs.check-release-tag.outputs.is_release_commit != 'true'
     name: 'Linux CPython (${{ matrix.cibw_archs }}, ${{ matrix.manylinux_image }})'
     runs-on: ubuntu-24.04-arm
     strategy:
@@ -199,6 +226,8 @@ jobs:
           retention-days: ${{ env.ARTIFACT_RETENTION }}
 
   cpython-macos:
+    needs: check-release-tag
+    if: github.event_name != 'push' || needs.check-release-tag.outputs.is_release_commit != 'true'
     name: 'macOS CPython  (${{ matrix.buildplat[1] }})'
     runs-on: ${{ matrix.buildplat[0] }}
     strategy:
@@ -286,6 +315,8 @@ jobs:
           retention-days: ${{ env.ARTIFACT_RETENTION }}
 
   cpython-windows:
+    needs: check-release-tag
+    if: github.event_name != 'push' || needs.check-release-tag.outputs.is_release_commit != 'true'
     name: 'Windows CPython (${{ matrix.cibw_archs }})'
     runs-on: windows-latest
     permissions:
@@ -393,6 +424,8 @@ jobs:
           retention-days: ${{ env.ARTIFACT_RETENTION }}
 
   source-distribution:
+    needs: check-release-tag
+    if: github.event_name != 'push' || needs.check-release-tag.outputs.is_release_commit != 'true'
     name: 'Source distribution'
     runs-on: ubuntu-22.04
     steps:
