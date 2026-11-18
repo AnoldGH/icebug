@@ -1,4 +1,10 @@
 #include <cstdint>
+#include <cstdlib>
+#include <stdexcept>
+#include <string>
+#ifndef _WIN32
+#include <dlfcn.h>
+#endif
 #include <networkit/community/ParallelLeiden.hpp>
 
 namespace NetworKit {
@@ -7,6 +13,83 @@ ParallelLeiden::ParallelLeiden(const Graph &graph, int iterations, bool randomiz
       random(randomize) {
     this->result = Partition(graph.numberOfNodes());
     this->result.allToSingletons();
+    if (const char *scoringLibEnv = std::getenv("NETWORKIT_LEIDEN_MOVE_SCORING_LIB")) {
+        loadMoveScoringExtension(scoringLibEnv);
+    }
+}
+
+ParallelLeiden::~ParallelLeiden() {
+    unloadMoveScoringExtension();
+}
+
+void ParallelLeiden::loadMoveScoringExtension(const std::string &sharedLibraryPath) {
+#ifdef _WIN32
+    throw std::runtime_error(
+        "ParallelLeiden shared-library scoring extensions are not supported on Windows");
+#else
+    void *handle = dlopen(sharedLibraryPath.c_str(), RTLD_NOW | RTLD_LOCAL);
+    if (handle == nullptr) {
+        throw std::runtime_error("Failed to load ParallelLeiden scoring extension '"
+                                 + sharedLibraryPath + "': " + dlerror());
+    }
+
+    dlerror();
+    auto *communityScore = reinterpret_cast<ParallelLeidenCommunityScoreFunction>(
+        dlsym(handle, "networkitParallelLeidenCommunityScore"));
+    const char *communityScoreError = dlerror();
+    if (communityScoreError != nullptr || communityScore == nullptr) {
+        dlclose(handle);
+        throw std::runtime_error(
+            "ParallelLeiden scoring extension '" + sharedLibraryPath
+            + "' does not export required symbol networkitParallelLeidenCommunityScore");
+    }
+
+    dlerror();
+    auto *thresholdScore = reinterpret_cast<ParallelLeidenCommunityScoreFunction>(
+        dlsym(handle, "networkitParallelLeidenCurrentCommunityThreshold"));
+    if (dlerror() != nullptr) {
+        thresholdScore = &modularityThresholdScore;
+    }
+
+    unloadMoveScoringExtension();
+    scoringExtensionHandle_ = handle;
+    communityScoreFunction_ = communityScore;
+    currentCommunityThresholdFunction_ =
+        thresholdScore != nullptr ? thresholdScore : &modularityThresholdScore;
+
+    dlerror();
+    auto *refineRSet = reinterpret_cast<ParallelLeidenRefineSetConditionFunction>(
+        dlsym(handle, "networkitParallelLeidenRefineRSetCondition"));
+    const char *refineRSetError = dlerror();
+    refineRSetConditionFunction_ = refineRSetError == nullptr && refineRSet != nullptr
+                                       ? refineRSet
+                                       : &modularityRefineRSetCondition;
+
+    dlerror();
+    auto *refineTSet = reinterpret_cast<ParallelLeidenRefineSetConditionFunction>(
+        dlsym(handle, "networkitParallelLeidenRefineTSetCondition"));
+    const char *refineTSetError = dlerror();
+    refineTSetConditionFunction_ = refineTSetError == nullptr && refineTSet != nullptr
+                                       ? refineTSet
+                                       : &modularityRefineTSetCondition;
+    scoringExtensionPath_ = sharedLibraryPath;
+#endif
+}
+
+void ParallelLeiden::unloadMoveScoringExtension() {
+    communityScoreFunction_ = &modularityCommunityScore;
+    currentCommunityThresholdFunction_ = &modularityThresholdScore;
+    refineRSetConditionFunction_ = &modularityRefineRSetCondition;
+    refineTSetConditionFunction_ = &modularityRefineTSetCondition;
+    scoringExtensionPath_.clear();
+#ifndef _WIN32
+    if (scoringExtensionHandle_ != nullptr) {
+        dlclose(scoringExtensionHandle_);
+        scoringExtensionHandle_ = nullptr;
+    }
+#else
+    scoringExtensionHandle_ = nullptr;
+#endif
 }
 
 void ParallelLeiden::run() {
@@ -22,6 +105,9 @@ void ParallelLeiden::run() {
         const Graph *currentGraph = G;
         GraphW coarse;
         Partition refined;
+        // Every node of the original graph counts as one; coarse nodes inherit the number of
+        // original nodes they contain.  Size-based objectives (CPM) need this; modularity ignores it.
+        nodeSizes.assign(currentGraph->upperNodeIdBound(), 1);
         calculateVolumes(*currentGraph);
         int innerIterations = 0;
         const int maxInnerIterations = 100; // Safety limit to prevent infinite loops
@@ -43,6 +129,11 @@ void ParallelLeiden::run() {
             ppc.run();
             auto temp = std::move(ppc.getCoarseGraph());
             auto map = std::move(ppc.getFineToCoarseNodeMapping());
+            {   // fold node sizes into the coarse nodes
+                std::vector<count> coarseSizes(temp.upperNodeIdBound(), 0);
+                currentGraph->forNodes([&](node u) { coarseSizes[map[u]] += nodeSizes[u]; });
+                nodeSizes = std::move(coarseSizes);
+            }
             // Maintain Partition, add every coarse Node to the community its fine Nodes were in
             //  unlike in louvain, 2 coarse Nodes can belong to the same community
             Partition p(temp.numberOfNodes());
@@ -67,14 +158,19 @@ void ParallelLeiden::calculateVolumes(const Graph &graph) {
     // Vol(G) is then 2*|E|
     communityVolumes.clear();
     communityVolumes.resize(result.upperBound() + VECTOR_OVERSIZE);
+    communitySizes.clear();
+    communitySizes.resize(result.upperBound() + VECTOR_OVERSIZE);
     inverseGraphVolume = 0.0; // Reset to 0 before accumulation
     if (graph.isWeighted()) {
         std::vector<double> threadVolumes(omp_get_max_threads());
         graph.parallelForNodes([&](node a) {
             {
                 edgeweight ew = graph.weightedDegree(a, true);
+                count size = nodeSizes[a];
 #pragma omp atomic
                 communityVolumes[result[a]] += ew;
+#pragma omp atomic
+                communitySizes[result[a]] += size;
                 threadVolumes[omp_get_thread_num()] += ew;
             }
         });
@@ -86,8 +182,11 @@ void ParallelLeiden::calculateVolumes(const Graph &graph) {
         inverseGraphVolume = 1.0 / (2 * graph.numberOfEdges());
         graph.parallelForNodes([&](node a) {
             {
+                count size = nodeSizes[a];
 #pragma omp atomic
                 communityVolumes[result[a]] += graph.weightedDegree(a, true);
+#pragma omp atomic
+                communitySizes[result[a]] += size;
             }
         });
     }
@@ -137,6 +236,7 @@ void ParallelLeiden::parallelMove(const Graph &graph) {
     for (auto &val : nodeState) {
         val.store(Idle);
     }
+
     std::queue<std::vector<node>> queue;
     std::mutex qlock;                      // queue lock
     std::condition_variable workAvailable; // waiting/notifying for new Nodes
@@ -252,6 +352,7 @@ void ParallelLeiden::parallelMove(const Graph &graph) {
                     nodeState[u].compare_exchange_strong(expectedState, Processing);
                 assert(startedProcessing);
                 tlx::unused(startedProcessing);
+
                 index currentCommunity = result[u];
                 double maxDelta = std::numeric_limits<double>::lowest();
                 index bestCommunity = none;
@@ -280,25 +381,32 @@ void ParallelLeiden::parallelMove(const Graph &graph) {
                     continue;
                 }
 
-                // Determine Modularity delta for all neighbor communities
+                const count nodeMass = nodeSizes[u];
+                // Score of moving the node into an empty community: zero cut, zero volume, zero
+                // size.  That is 0 for modularity and for CPM, but let the scorer decide.
+                const double singletonScore = scoreCommunity(0.0, degree, 0.0, nodeMass, 0);
+
+                // Determine the move score for all neighbor communities
                 for (auto community : pointers) {
                     // "Moving" a node to its current community is pointless
                     if (community != currentCommunity) {
                         double delta;
-                        delta = modularityDelta(cutWeights[community], degree,
-                                                communityVolumes[community]);
+                        delta = scoreCommunity(cutWeights[community], degree,
+                                               communityVolumes[community], nodeMass,
+                                               communitySizes[community]);
                         if (delta > maxDelta) {
                             maxDelta = delta;
                             bestCommunity = community;
                         }
                     }
                 }
-                double modThreshold = modularityThreshold(
-                    cutWeights[currentCommunity], communityVolumes[currentCommunity], degree);
+                double modThreshold = scoreCurrentCommunityThreshold(
+                    cutWeights[currentCommunity], degree, communityVolumes[currentCommunity],
+                    nodeMass, communitySizes[currentCommunity]);
 
-                if (0 > modThreshold || maxDelta > modThreshold) {
+                if (singletonScore > modThreshold || maxDelta > modThreshold) {
                     moved[omp_get_thread_num()]++;
-                    if (0 > maxDelta) { // move node to empty community
+                    if (singletonScore > maxDelta) { // move node to empty community
                         singleton++;
                         bestCommunity = upperBound++;
                         if (bestCommunity >= communityVolumes.size()) {
@@ -314,6 +422,7 @@ void ParallelLeiden::parallelMove(const Graph &graph) {
                                 }
                                 // all other threads are yielding, so resize is fine
                                 communityVolumes.resize(vectorSize);
+                                communitySizes.resize(vectorSize);
                                 expected = true;
                                 resize.compare_exchange_strong(expected, false);
                             } else {
@@ -331,6 +440,10 @@ void ParallelLeiden::parallelMove(const Graph &graph) {
                     communityVolumes[bestCommunity] += degree;
 #pragma omp atomic
                     communityVolumes[currentCommunity] -= degree;
+#pragma omp atomic
+                    communitySizes[bestCommunity] += nodeMass;
+#pragma omp atomic
+                    communitySizes[currentCommunity] -= nodeMass;
                     changed = true;
                     graph.forNeighborsOf(u, [&](node neighbor) {
                         // Only add the node to the queue if it's not already
@@ -404,6 +517,7 @@ Partition ParallelLeiden::parallelRefine(const Graph &graph) {
     std::vector<uint_fast8_t> singleton(refined.upperBound(), true);
     std::vector<double> cutCtoSminusC(refined.upperBound());
     std::vector<double> refinedVolumes(refined.upperBound()); // Community Volumes P_refined
+    std::vector<count> refinedSizes(refined.upperBound());   // Community sizes P_refined
     std::vector<std::mutex> locks(refined.upperBound());
     std::vector<node> nodes(graph.upperNodeIdBound(), none);
 #pragma omp parallel
@@ -416,6 +530,7 @@ Partition ParallelLeiden::parallelRefine(const Graph &graph) {
         for (omp_index u = 0; u < static_cast<omp_index>(graph.upperNodeIdBound()); u++) {
             if (graph.hasNode(u)) {
                 nodes[u] = u;
+                refinedSizes[u] = nodeSizes[u];
                 graph.forNeighborsOf(u, [&](node neighbor, edgeweight ew) {
                     if (u != neighbor) {
                         if (result[neighbor] == result[u]) {
@@ -478,8 +593,10 @@ Partition ParallelLeiden::parallelRefine(const Graph &graph) {
                     degree += ew;
                 }
             });
-            if (cutCtoSminusC[u] < this->gamma * degree * (communityVolumes[S] - degree)
-                                       * inverseGraphVolume) { // R-Set Condition
+            const count subsetSize = nodeSizes[u];
+            if (!refineRSetCondition(cutCtoSminusC[u], degree, subsetSize,
+                                     communityVolumes[S] - degree, communitySizes[S] - subsetSize,
+                                     communityVolumes[S], communitySizes[S])) { // R-Set Condition
                 continue;
             }
 
@@ -489,6 +606,8 @@ Partition ParallelLeiden::parallelRefine(const Graph &graph) {
 
             double delta;
             index bestC = none;
+            // Staying put means an empty community: zero cut, zero volume, zero size.
+            const double singletonScore = scoreCommunity(0.0, degree, 0.0, subsetSize, 0);
             double bestDelta = std::numeric_limits<double>::lowest();
             int idx;
             // Determine Community that yields highest modularity delta
@@ -498,16 +617,20 @@ Partition ParallelLeiden::parallelRefine(const Graph &graph) {
                     if (C == none) {
                         continue;
                     }
-                    delta = modularityDelta(cutWeights[C], degree, refinedVolumes[C]);
+                    delta = scoreCommunity(cutWeights[C], degree, refinedVolumes[C], subsetSize,
+                                           refinedSizes[C]);
 
-                    if (delta < 0) { // modThreshold is 0, since cutw(v,C-) = 0 and volw(C-) = 0
+                    if (delta < singletonScore) { // score of staying in an empty community
                         continue;
                     }
 
                     auto volC = refinedVolumes[C];
+                    auto sizeC = refinedSizes[C];
                     if (delta > bestDelta
-                        && cutCtoSminusC[C] >= this->gamma * volC * (communityVolumes[S] - volC)
-                                                   * inverseGraphVolume) { // T-Set Condition
+                        && refineTSetCondition(cutCtoSminusC[C], volC, sizeC,
+                                               communityVolumes[S] - volC,
+                                               communitySizes[S] - sizeC, communityVolumes[S],
+                                               communitySizes[S])) { // T-Set Condition
                         bestDelta = delta;
                         bestC = C;
                         idx = j;
@@ -577,6 +700,7 @@ Partition ParallelLeiden::parallelRefine(const Graph &graph) {
                 singleton[bestC] = false;
                 refined[u] = bestC;
                 refinedVolumes[bestC] += degree;
+                refinedSizes[bestC] += subsetSize;
                 updateCut();
                 cutCtoSminusC[bestC] += cutCtoSminusC[u] - 2 * cutWeights[bestC];
             }

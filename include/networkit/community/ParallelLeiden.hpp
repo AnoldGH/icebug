@@ -2,6 +2,7 @@
 #define NETWORKIT_COMMUNITY_PARALLEL_LEIDEN_HPP_
 
 #include <atomic>
+#include <string>
 #include <condition_variable>
 #include <iomanip>
 #include <iostream>
@@ -17,6 +18,7 @@
 #include <networkit/coarsening/ParallelPartitionCoarsening.hpp>
 #include <networkit/community/CommunityDetectionAlgorithm.hpp>
 #include <networkit/community/Modularity.hpp>
+#include <networkit/community/ParallelLeidenScoringExtension.hpp>
 #include <networkit/community/PLM.hpp>
 #include <networkit/graph/Graph.hpp>
 #include <networkit/structures/Partition.hpp>
@@ -41,17 +43,91 @@ public:
     explicit ParallelLeiden(const Graph &graph, int iterations = 3, bool randomize = true,
                             double gamma = 1);
 
+    ~ParallelLeiden() override;
+
     void run() override;
+
+    /**
+     * Load a shared library that customizes the move-phase scoring metric, using the same ABI as
+     * ParallelLeidenView (see ParallelLeidenScoringExtension.hpp).  With the CPM extension loaded,
+     * this materialising implementation optimises the Constant Potts Model instead of modularity.
+     */
+    void loadMoveScoringExtension(const std::string &sharedLibraryPath);
+
+    void unloadMoveScoringExtension();
 
     int VECTOR_OVERSIZE = 10000;
 
 private:
-    inline double modularityDelta(double cutD, double degreeV, double volD) const {
+    // Default scoring: modularity.  Signatures and semantics match ParallelLeidenView so that one
+    // scoring extension (for instance ParallelLeidenCPMScoringExtension) serves both classes.
+    static double modularityCommunityScore(double cutD, double degreeV, double volD,
+                                           count subsetSize, count sizeD, double gamma,
+                                           double inverseGraphVolume) {
+        tlx::unused(subsetSize);
+        tlx::unused(sizeD);
         return cutD - gamma * degreeV * volD * inverseGraphVolume;
-    };
+    }
 
-    inline double modularityThreshold(double cutC, double volC, double degreeV) const {
+    static double modularityThresholdScore(double cutC, double degreeV, double volC,
+                                           count subsetSize, count sizeC, double gamma,
+                                           double inverseGraphVolume) {
+        tlx::unused(subsetSize);
+        tlx::unused(sizeC);
         return cutC - gamma * (volC - degreeV) * degreeV * inverseGraphVolume;
+    }
+
+    static bool modularityRefineRSetCondition(double cutWeight, double subsetVolume,
+                                              count subsetSize, double targetVolume,
+                                              count targetSize, double sourceVolume,
+                                              count sourceSize, double gamma,
+                                              double inverseGraphVolume) {
+        tlx::unused(subsetSize);
+        tlx::unused(targetSize);
+        tlx::unused(sourceVolume);
+        tlx::unused(sourceSize);
+        return cutWeight >= gamma * subsetVolume * targetVolume * inverseGraphVolume;
+    }
+
+    static bool modularityRefineTSetCondition(double cutWeight, double subsetVolume,
+                                              count subsetSize, double targetVolume,
+                                              count targetSize, double sourceVolume,
+                                              count sourceSize, double gamma,
+                                              double inverseGraphVolume) {
+        tlx::unused(subsetSize);
+        tlx::unused(targetSize);
+        tlx::unused(sourceVolume);
+        tlx::unused(sourceSize);
+        return cutWeight >= gamma * subsetVolume * targetVolume * inverseGraphVolume;
+    }
+
+    inline double scoreCommunity(double cutWeight, double degree, double communityVolume,
+                                 count subsetSize, count communitySize) const {
+        return communityScoreFunction_(cutWeight, degree, communityVolume, subsetSize,
+                                       communitySize, gamma, inverseGraphVolume);
+    }
+
+    inline double scoreCurrentCommunityThreshold(double cutWeight, double degree,
+                                                 double communityVolume, count subsetSize,
+                                                 count communitySize) const {
+        return currentCommunityThresholdFunction_(cutWeight, degree, communityVolume, subsetSize,
+                                                  communitySize, gamma, inverseGraphVolume);
+    }
+
+    inline bool refineRSetCondition(double cutWeight, double subsetVolume, count subsetSize,
+                                    double targetVolume, count targetSize, double sourceVolume,
+                                    count sourceSize) const {
+        return refineRSetConditionFunction_(cutWeight, subsetVolume, subsetSize, targetVolume,
+                                            targetSize, sourceVolume, sourceSize, gamma,
+                                            inverseGraphVolume);
+    }
+
+    inline bool refineTSetCondition(double cutWeight, double subsetVolume, count subsetSize,
+                                    double targetVolume, count targetSize, double sourceVolume,
+                                    count sourceSize) const {
+        return refineTSetConditionFunction_(cutWeight, subsetVolume, subsetSize, targetVolume,
+                                            targetSize, sourceVolume, sourceSize, gamma,
+                                            inverseGraphVolume);
     }
 
     static inline void lockLowerFirst(index a, index b, std::vector<std::mutex> &locks) {
@@ -76,6 +152,11 @@ private:
 
     std::vector<double> communityVolumes;
 
+    // Number of original nodes in each community, and in each node of the current level.  Needed by
+    // size-based objectives such as CPM; unused by modularity.
+    std::vector<count> communitySizes;
+    std::vector<count> nodeSizes;
+
     std::vector<std::vector<node>> mappings;
 
     static constexpr int WORKING_SIZE = 1000;
@@ -89,6 +170,16 @@ private:
     Aux::SignalHandler handler;
 
     bool random;
+
+    void *scoringExtensionHandle_ = nullptr;
+    ParallelLeidenCommunityScoreFunction communityScoreFunction_ = &modularityCommunityScore;
+    ParallelLeidenCommunityScoreFunction currentCommunityThresholdFunction_ =
+        &modularityThresholdScore;
+    ParallelLeidenRefineSetConditionFunction refineRSetConditionFunction_ =
+        &modularityRefineRSetCondition;
+    ParallelLeidenRefineSetConditionFunction refineTSetConditionFunction_ =
+        &modularityRefineTSetCondition;
+    std::string scoringExtensionPath_;
 };
 
 } // namespace NetworKit
