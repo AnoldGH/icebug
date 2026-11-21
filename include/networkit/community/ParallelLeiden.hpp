@@ -171,6 +171,10 @@ private:
 
     bool random;
 
+    // Maximum moves per node within a Leiden iteration (ICEBUG_LEIDEN_MAX_MOVES_PER_NODE).
+    // Mirrors the limit ParallelLeidenView enforces since b72c5461a.
+    int maxMovesPerNode = 20;
+
     void *scoringExtensionHandle_ = nullptr;
     ParallelLeidenCommunityScoreFunction communityScoreFunction_ = &modularityCommunityScore;
     ParallelLeidenCommunityScoreFunction currentCommunityThresholdFunction_ =

@@ -13,6 +13,16 @@ ParallelLeiden::ParallelLeiden(const Graph &graph, int iterations, bool randomiz
       random(randomize) {
     this->result = Partition(graph.numberOfNodes());
     this->result.allToSingletons();
+    if (const char *maxMovesPerNodeEnv = std::getenv("ICEBUG_LEIDEN_MAX_MOVES_PER_NODE")) {
+        try {
+            const int parsed = std::stoi(maxMovesPerNodeEnv);
+            if (parsed > 0) {
+                maxMovesPerNode = parsed;
+            }
+        } catch (...) {
+            // Keep default if parsing fails.
+        }
+    }
     if (const char *scoringLibEnv = std::getenv("NETWORKIT_LEIDEN_MOVE_SCORING_LIB")) {
         loadMoveScoringExtension(scoringLibEnv);
     }
@@ -237,6 +247,14 @@ void ParallelLeiden::parallelMove(const Graph &graph) {
         val.store(Idle);
     }
 
+    // Per-node cap on how often one node may move within a Leiden iteration, the limit
+    // ParallelLeidenView enforces since b72c5461a.
+    std::vector<std::atomic<uint32_t>> movesPerNode(graph.upperNodeIdBound());
+    for (auto &moves : movesPerNode) {
+        moves.store(0);
+    }
+    std::vector<count> nodePassesSkippedByMoveLimit(omp_get_max_threads(), 0);
+
     std::queue<std::vector<node>> queue;
     std::mutex qlock;                      // queue lock
     std::condition_variable workAvailable; // waiting/notifying for new Nodes
@@ -271,6 +289,11 @@ void ParallelLeiden::parallelMove(const Graph &graph) {
         // cutWeight[Community] returns cut of Node to Community
         std::vector<double> cutWeights(communityVolumes.capacity());
         std::vector<index> pointers;
+
+        auto moveLimitReached = [&](node candidate) {
+            return movesPerNode[candidate].load(std::memory_order_relaxed)
+                   >= static_cast<uint32_t>(maxMovesPerNode);
+        };
 
         auto pushNewNode = [&](node queuedNode) {
             newNodes.push_back(queuedNode);
@@ -353,6 +376,12 @@ void ParallelLeiden::parallelMove(const Graph &graph) {
                 assert(startedProcessing);
                 tlx::unused(startedProcessing);
 
+                if (moveLimitReached(u)) {
+                    nodePassesSkippedByMoveLimit[omp_get_thread_num()]++;
+                    finishProcessingNode(u);
+                    continue;
+                }
+
                 index currentCommunity = result[u];
                 double maxDelta = std::numeric_limits<double>::lowest();
                 index bestCommunity = none;
@@ -406,6 +435,7 @@ void ParallelLeiden::parallelMove(const Graph &graph) {
 
                 if (singletonScore > modThreshold || maxDelta > modThreshold) {
                     moved[omp_get_thread_num()]++;
+                    movesPerNode[u].fetch_add(1, std::memory_order_relaxed);
                     if (singletonScore > maxDelta) { // move node to empty community
                         singleton++;
                         bestCommunity = upperBound++;
