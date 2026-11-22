@@ -11,8 +11,9 @@ commit:
 
 | Used for | Version | What it contains |
 |---|---|---|
-| RQ2: thread scaling of ParallelLeiden (PL) and ParallelLeidenView (PLV) | **this branch**, [`manuscript-pl-movecap`](https://github.com/AnoldGH/icebug/tree/manuscript-pl-movecap) (`2f40f63`) | Upstream `b72c546` + CPM support for PL + a per-node move cap on PL |
 | RQ1: comparison with other Leiden implementations | [`manuscript`](https://github.com/AnoldGH/icebug/tree/manuscript) (`f30a6ca`) | Upstream `b72c546` + CPM support for PL |
+| RQ2: thread scaling of ParallelLeiden (PL) and ParallelLeidenView (PLV) | **this branch**, [`manuscript-pl-movecap`](https://github.com/AnoldGH/icebug/tree/manuscript-pl-movecap) (`2f40f63`) | Upstream `b72c546` + CPM support for PL + a per-node move cap on PL |
+| RQ3 & RQ4 | Either [`manuscript`](https://github.com/AnoldGH/icebug/tree/manuscript) (`f30a6ca`), [`manuscript-pl-movecap`](https://github.com/AnoldGH/icebug/tree/manuscript-pl-movecap) (`2f40f63`), or Upstream `b72c546` | PLV is not changed across these three branches |
 | Appendix (scheduling policy) | upstream [`713c8e5`](https://github.com/Ladybug-Memory/icebug/commit/713c8e57aa40d72e9564b3812384bd2defe8e087) | Unmodified upstream Icebug, without the stricter scheduling policy |
 
 Both branches are based on upstream commit
