@@ -1,3 +1,88 @@
+> [!NOTE]
+> **This branch accompanies the manuscript "Scalable Clustering with Memory-Efficient Computations".**
+> It is a fork of [Ladybug-Memory/icebug](https://github.com/Ladybug-Memory/icebug) with small
+> additions for that study. The original Icebug README follows below this section, and its
+> installation and build instructions apply here unchanged.
+
+## Code versions used in the manuscript
+
+The manuscript uses several versions of Icebug. Each one is a branch of this fork or an upstream
+commit:
+
+| Used for | Version | What it contains |
+|---|---|---|
+| RQ2: thread scaling of ParallelLeiden (PL) and ParallelLeidenView (PLV) | **this branch**, [`manuscript-pl-movecap`](https://github.com/AnoldGH/icebug/tree/manuscript-pl-movecap) (`2f40f63`) | Upstream `b72c546` + CPM support for PL + a per-node move cap on PL |
+| RQ1: comparison with other Leiden implementations | [`manuscript`](https://github.com/AnoldGH/icebug/tree/manuscript) (`f30a6ca`) | Upstream `b72c546` + CPM support for PL |
+| Appendix (scheduling policy) | upstream [`713c8e5`](https://github.com/Ladybug-Memory/icebug/commit/713c8e57aa40d72e9564b3812384bd2defe8e087) | Unmodified upstream Icebug, without the stricter scheduling policy |
+
+Both branches are based on upstream commit
+[`b72c546`](https://github.com/Ladybug-Memory/icebug/commit/b72c5461a39d529b84ee0929579243247efb83ef).
+The two commits added on top are:
+
+1. **`f30a6ca` — CPM scoring extension for ParallelLeiden.** Upstream, only PLV can optimise the
+   Constant Potts Model (CPM), through a loadable scoring extension. This commit lets PL load the
+   same extension. PL still optimises modularity by default.
+2. **`2f40f63` — per-node move limit for ParallelLeiden.** Within each Leiden iteration, a node
+   may move at most 20 times, the same limit PLV has enforced since `b72c546`. This keeps the two
+   implementations under the same scheduling rules for the scaling experiments. The commit is on
+   this branch only.
+
+## Building
+
+Follow the Icebug installation instructions below. For example, from a clone of this branch:
+
+```bash
+git clone -b manuscript-pl-movecap https://github.com/AnoldGH/icebug.git
+cd icebug
+pip install -e .
+```
+
+The build also compiles the CPM extension as a separate shared library,
+`networkit_parallel_leiden_cpm_extension*.so`, and places it next to the Python package.
+
+## Running ParallelLeiden with CPM
+
+Load the CPM extension into the algorithm object before calling `run()`. The resolution parameter
+is `gamma`:
+
+```python
+import glob, os
+import networkit as nk
+
+G = nk.readGraph("graph.metis", nk.Format.METIS)   # any graph Icebug can load
+
+# The CPM extension sits next to the installed networkit package.
+pkg_root = os.path.dirname(os.path.dirname(os.path.abspath(nk.__file__)))
+cpm_ext = glob.glob(os.path.join(pkg_root, "networkit", "*parallel_leiden_cpm_extension*.so"))[0]
+
+leiden = nk.community.ParallelLeiden(G, iterations=3, randomize=True, gamma=0.001)
+leiden.loadMoveScoringExtension(cpm_ext)   # without this line, PL optimises modularity
+leiden.run()
+partition = leiden.getPartition()
+```
+
+`ParallelLeidenView` uses the same extension in the same way. Two other ways to control the run:
+
+- **Environment variable:** if `NETWORKIT_LEIDEN_MOVE_SCORING_LIB=/path/to/networkit_parallel_leiden_cpm_extension.so`
+  is set, every new `ParallelLeiden` object loads that extension when it is created.
+- **Unloading:** `leiden.unloadMoveScoringExtension()` switches back to modularity.
+
+### Per-node move cap (this branch only)
+
+The cap defaults to 20 moves per node per iteration. To change it, set
+`ICEBUG_LEIDEN_MAX_MOVES_PER_NODE` to a positive integer before the algorithm object is created.
+Upstream PLV reads the same variable.
+
+```bash
+ICEBUG_LEIDEN_MAX_MOVES_PER_NODE=20 python my_script.py
+```
+
+The `manuscript` branch has no cap on PL; it matches the RQ1 experiments.
+
+---
+
+<!-- Original Icebug README continues below -->
+
 <p align="center">
   <img width="60%" src="docs/logo/logo_color.jpg" alt="Icebug - Frozen Graph Analytics"><br>
   <a href="https://github.com/Ladybug-Memory/icebug/actions"><img src="https://github.com/Ladybug-Memory/icebug/workflows/build/badge.svg"></a>
